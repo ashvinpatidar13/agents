@@ -5,8 +5,9 @@ import logging
 import os
 import sys
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, List
 from zoneinfo import ZoneInfo
+import asyncio
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -25,10 +26,53 @@ from livekit.agents import (
     function_tool,
 )
 from livekit.plugins import cartesia, deepgram, openai, silero
-from livekit.plugins.turn_detector.multilingual import MultilingualModel
+# from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 load_dotenv()
 
+# ---------------------- NEW INTERRUPT HANDLER ----------------------
+
+class InterruptHandler:
+    """
+    Handles filler-word-based interruption filtering during voice interaction.
+    """
+    def __init__(self, ignored_words: List[str] | None = None):
+        env_list = os.getenv("IGNORED_FILLERS", "uh,umm,hmm,haan").split(",")
+        self.ignored_words = set(w.strip().lower() for w in (ignored_words or env_list))
+        self.agent_speaking = False
+        self.logger = logging.getLogger("interrupt-handler")
+
+    def set_agent_state(self, is_speaking: bool):
+        """Update the agent speaking status."""
+        self.agent_speaking = is_speaking
+
+    async def handle_transcription(self, text: str, confidence: float = 0.9) -> bool:
+        """
+        Returns True if interruption should be passed to agent.
+        Returns False if it's a filler-only utterance while agent is speaking.
+        """
+        cleaned = text.strip().lower()
+
+        # Ignore very low confidence transcriptions
+        if confidence < 0.6:
+            self.logger.debug(f"Ignored low-confidence input: {cleaned}")
+            return False
+
+        # If agent not speaking, treat all speech normally
+        if not self.agent_speaking:
+            return True
+
+        # Agent is speaking — check if filler or real interruption
+        tokens = cleaned.split()
+        if all(word in self.ignored_words for word in tokens):
+            self.logger.info(f"Ignored filler interruption: '{cleaned}'")
+            return False
+
+        # Mixed or valid interruption (contains command words)
+        self.logger.info(f"Valid interruption detected: '{cleaned}'")
+        return True
+
+# ------------------------------------------------------------------
 
 @dataclass
 class Userdata:
@@ -48,14 +92,12 @@ class FrontDeskAgent(Agent):
                 f"You are Front-Desk, a helpful and efficient voice assistant. "
                 f"Today is {today}. Your main goal is to schedule an appointment for the user. "
                 "This is a voice conversation — speak naturally, clearly, and concisely. "
-                "When the user says hello or greets you, don’t just respond with a greeting — use it as an opportunity to move things forward. "
-                "For example, follow up with a helpful question like: 'Would you like to book a time?' "
-                "When asked for availability, call list_available_slots and offer a few clear, simple options. "
-                "Say things like 'Monday at 2 PM' — avoid timezones, timestamps, and avoid saying 'AM' or 'PM'. "
-                "Use natural phrases like 'in the morning' or 'in the evening', and don’t mention the year unless it’s different from the current one. "
-                "Offer a few options at a time, pause for a response, then guide the user to confirm. "
-                "If the time is no longer available, let them know gently and offer the next options. "
-                "Always keep the conversation flowing — be proactive, human, and focused on helping the user schedule with ease."
+                "When the user greets you, use that as an opportunity to move things forward. "
+                "For example: 'Would you like to book a time?' "
+                "When asked for availability, call list_available_slots and offer clear options. "
+                "Avoid AM/PM and timestamps; use 'morning' or 'evening'. "
+                "If a time is unavailable, inform the user and suggest another. "
+                "Always keep the conversation flowing — be proactive, human, and helpful."
             )
         )
 
@@ -67,12 +109,6 @@ class FrontDeskAgent(Agent):
         ctx: RunContext[Userdata],
         slot_id: str,
     ) -> str | None:
-        """
-        Schedule an appointment at the given slot.
-
-        Args:
-            slot_id: The identifier for the selected time slot (as shown in the list of available slots).
-        """
         if not (slot := self._slots_map.get(slot_id)):
             raise ToolError(f"error: slot {slot_id} was not found")
 
@@ -88,8 +124,6 @@ class FrontDeskAgent(Agent):
                 start_time=slot.start_time, attendee_email=email_result.email_address
             )
         except SlotUnavailableError:
-            # exceptions other than ToolError are treated as "An internal error occured" for the LLM.
-            # Tell the LLM this slot isn't available anymore
             raise ToolError("This slot isn't available anymore") from None
 
         local = slot.start_time.astimezone(self.tz)
@@ -99,18 +133,6 @@ class FrontDeskAgent(Agent):
     async def list_available_slots(
         self, ctx: RunContext[Userdata], range: Literal["+2week", "+1month", "+3month", "default"]
     ) -> str:
-        """
-        Return a plain-text list of available slots, one per line.
-
-        <slot_id> – <Weekday>, <Month> <Day>, <Year> at <HH:MM> <TZ> (<relative time>)
-
-        You must infer the appropriate ``range`` implicitly from the
-        conversational context and **must not** prompt the user to pick a value
-        explicitly.
-
-        Args:
-            range: Determines how far ahead to search for free time slots.
-        """
         now = datetime.datetime.now(self.tz)
         lines: list[str] = []
 
@@ -130,10 +152,7 @@ class FrontDeskAgent(Agent):
             seconds = delta.seconds
 
             if local.date() == now.date():
-                if seconds < 3600:
-                    rel = "in less than an hour"
-                else:
-                    rel = "later today"
+                rel = "in less than an hour" if seconds < 3600 else "later today"
             elif local.date() == (now.date() + datetime.timedelta(days=1)):
                 rel = "tomorrow"
             elif days < 7:
@@ -156,29 +175,45 @@ async def entrypoint(ctx: JobContext):
     await ctx.connect()
 
     timezone = "utc"
+    interrupt_handler = InterruptHandler()
 
     if cal_api_key := os.getenv("CAL_API_KEY", None):
         logger.info("CAL_API_KEY detected, using cal.com calendar")
         cal = CalComCalendar(api_key=cal_api_key, timezone=timezone)
     else:
-        logger.warning(
-            "CAL_API_KEY is not set. Falling back to FakeCalendar; set CAL_API_KEY to enable Cal.com integration."
-        )
+        logger.warning("CAL_API_KEY not set. Using FakeCalendar fallback.")
         cal = FakeCalendar(timezone=timezone)
 
     await cal.initialize()
 
     session = AgentSession[Userdata](
         userdata=Userdata(cal=cal),
-        stt=deepgram.STT(),
-        llm=openai.LLM(model="gpt-4o", parallel_tool_calls=False, temperature=0.45),
+        stt="assemblyai/universal-streaming:en",
+        llm="google/gemini-2.0-flash",
         tts=cartesia.TTS(voice="39b376fc-488e-4d0c-8b37-e00b72059fdd", speed="fast"),
-        turn_detection=MultilingualModel(),
+        # turn_detection=MultilingualModel(),
         vad=silero.VAD.load(),
         max_tool_steps=1,
     )
 
-    await session.start(agent=FrontDeskAgent(timezone=timezone), room=ctx.room)
+    agent = FrontDeskAgent(timezone=timezone)
+
+    async def event_loop():
+        async for event in session.events():
+            if event.type == "playback_started":
+                interrupt_handler.set_agent_state(True)
+            elif event.type == "playback_finished":
+                interrupt_handler.set_agent_state(False)
+            elif event.type == "transcription":
+                text = getattr(event, "text", "").strip()
+                confidence = getattr(event, "confidence", 0.9)
+                allow_interrupt = await interrupt_handler.handle_transcription(text, confidence)
+                if not allow_interrupt:
+                    continue  # Skip filler interruptions
+
+            await session.handle_event(event)
+
+    await asyncio.gather(event_loop(), session.start(agent=agent, room=ctx.room))
 
 
 if __name__ == "__main__":
